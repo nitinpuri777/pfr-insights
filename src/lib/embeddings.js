@@ -1,9 +1,17 @@
 import { supabase } from './supabase'
 
 /**
+ * Check if we should use the secure API route
+ */
+function useSecureAPI() {
+  return import.meta.env.PROD && !import.meta.env.VITE_OPENAI_API_KEY
+}
+
+/**
  * Get the embedding provider based on available API keys
  */
 function getEmbeddingProvider() {
+  if (useSecureAPI()) return 'api'
   if (import.meta.env.VITE_OPENAI_API_KEY) return 'openai'
   if (import.meta.env.VITE_GEMINI_API_KEY) return 'gemini'
   return null
@@ -28,6 +36,18 @@ export async function generateEmbedding(text) {
   if (!cleanText) return null
 
   try {
+    // Use secure API route in production
+    if (provider === 'api') {
+      const response = await fetch('/api/llm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'embed', input: cleanText }),
+      })
+      const data = await response.json()
+      if (data.error) throw new Error(data.error)
+      return data.embedding || null
+    }
+
     if (provider === 'openai') {
       const response = await fetch('https://api.openai.com/v1/embeddings', {
         method: 'POST',

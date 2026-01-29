@@ -1,6 +1,14 @@
 import { findSimilarFeedback, findSimilarIdeas, embedIdea, embedFeedback } from './embeddings'
 
+// Check if we should use the secure API route (production) or direct calls (development)
+function useSecureAPI() {
+  // In production on Vercel, use the API route
+  // In development with VITE_ keys, use direct calls (less secure but convenient)
+  return import.meta.env.PROD && !import.meta.env.VITE_OPENAI_API_KEY
+}
+
 export function getProvider() {
+  if (useSecureAPI()) return 'api' // Use Vercel API route
   if (import.meta.env.VITE_OPENAI_API_KEY) return 'openai'
   if (import.meta.env.VITE_ANTHROPIC_API_KEY) return 'anthropic'
   if (import.meta.env.VITE_GEMINI_API_KEY) return 'gemini'
@@ -10,6 +18,18 @@ export function getProvider() {
 export async function callLLM(messages, provider = null) {
   const p = provider || getProvider()
   if (!p) throw new Error('No LLM API key configured')
+  
+  // Use secure API route in production
+  if (p === 'api') {
+    const res = await fetch('/api/llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'chat', messages }),
+    })
+    const data = await res.json()
+    if (data.error) throw new Error(data.error)
+    return data.content
+  }
   
   if (p === 'openai') {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
