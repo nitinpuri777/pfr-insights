@@ -4,7 +4,8 @@ import { supabase } from './supabase'
  * Check if we should use the secure API route
  */
 function useSecureAPI() {
-  return import.meta.env.PROD && !import.meta.env.VITE_OPENAI_API_KEY
+  const hasViteKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_GEMINI_API_KEY
+  return import.meta.env.PROD && !hasViteKey
 }
 
 /**
@@ -14,6 +15,8 @@ function getEmbeddingProvider() {
   if (useSecureAPI()) return 'api'
   if (import.meta.env.VITE_OPENAI_API_KEY) return 'openai'
   if (import.meta.env.VITE_GEMINI_API_KEY) return 'gemini'
+  // Last resort: try API route in production
+  if (import.meta.env.PROD) return 'api'
   return null
 }
 
@@ -168,7 +171,8 @@ export async function findSimilarFeedback(ideaTitle, ideaDescription = '', optio
 
   // Filter out already linked feedback if requested
   if (excludeLinked) {
-    results = results.filter(f => f.triage_status !== 'linked')
+    // Exclude already triaged feedback (includes legacy 'linked' status)
+    results = results.filter(f => f.triage_status !== 'triaged' && f.triage_status !== 'linked')
   }
 
   // Filter out specific feedback IDs
@@ -269,4 +273,163 @@ export async function batchEmbedIdeas(onProgress = null) {
   }
 
   return { processed, total: ideas.length }
+}
+
+// ============================================
+// PRODUCT AREA EMBEDDINGS (for fast routing)
+// ============================================
+
+/**
+ * Generate embedding text for a product area
+ * Combines name, description, and keywords for richer semantic matching
+ */
+function getProductAreaEmbeddingText(area) {
+  const parts = [
+    area.name,
+    area.description || '',
+    ...(area.keywords || [])
+  ].filter(Boolean)
+  return parts.join('. ')
+}
+
+/**
+ * Generate and store embedding for a product area
+ */
+export async function embedProductArea(area) {
+  const text = getProductAreaEmbeddingText(area)
+  const embedding = await generateEmbedding(text)
+  if (!embedding) return false
+
+  try {
+    const { error } = await supabase
+      .from('product_areas')
+      .update({ embedding })
+      .eq('id', area.id)
+
+    if (error) {
+      console.error('Failed to store product area embedding:', error)
+      return false
+    }
+    return true
+  } catch (e) {
+    // Column might not exist yet
+    console.log('Could not save embedding (migration may be needed)')
+    return false
+  }
+}
+
+/**
+ * Batch embed all product areas
+ */
+export async function batchEmbedProductAreas(productAreas, onProgress = null) {
+  let processed = 0
+  for (const area of productAreas) {
+    await embedProductArea(area)
+    processed++
+    if (onProgress) {
+      onProgress({ processed, total: productAreas.length })
+    }
+    await new Promise(r => setTimeout(r, 100))
+  }
+  return { processed, total: productAreas.length }
+}
+
+/**
+ * Cosine similarity between two vectors
+ */
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return 0
+  let dotProduct = 0
+  let normA = 0
+  let normB = 0
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i]
+    normA += a[i] * a[i]
+    normB += b[i] * b[i]
+  }
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB))
+}
+
+/**
+ * Match feedback items to product areas using vector similarity
+ * This is the FAST alternative to LLM-based routing
+ * 
+ * @param {Array} feedbackItems - Array of feedback with embeddings
+ * @param {Array} productAreas - Array of product areas with embeddings and owner info
+ * @returns {Array} - Array of { feedbackId, productAreaId, ownerId, confidence }
+ */
+export async function matchFeedbackToProductAreasViaEmbeddings(feedbackItems, productAreas) {
+  const results = []
+  
+  // Filter to product areas that have embeddings and owners
+  const areasWithEmbeddings = productAreas.filter(a => a.embedding && a.owner_id)
+  
+  if (areasWithEmbeddings.length === 0) {
+    console.warn('No product areas with embeddings found')
+    return feedbackItems.map(f => ({
+      feedbackId: f.id,
+      productAreaId: null,
+      ownerId: null,
+      confidence: 0,
+      reasoning: 'No product areas with embeddings'
+    }))
+  }
+
+  for (const feedback of feedbackItems) {
+    // If feedback doesn't have embedding, generate one on the fly
+    let feedbackEmbedding = feedback.embedding
+    if (!feedbackEmbedding) {
+      feedbackEmbedding = await generateEmbedding(
+        `${feedback.title || ''}. ${feedback.description || ''}`
+      )
+    }
+
+    if (!feedbackEmbedding) {
+      results.push({
+        feedbackId: feedback.id,
+        productAreaId: null,
+        ownerId: null,
+        confidence: 0,
+        reasoning: 'Could not generate embedding'
+      })
+      continue
+    }
+
+    // Find best matching product area
+    let bestMatch = null
+    let bestScore = 0
+
+    for (const area of areasWithEmbeddings) {
+      const score = cosineSimilarity(feedbackEmbedding, area.embedding)
+      if (score > bestScore) {
+        bestScore = score
+        bestMatch = area
+      }
+    }
+
+    // Convert cosine similarity to confidence (0.5 similarity ≈ 0.5 confidence, 0.8 ≈ 0.9)
+    // Cosine similarity ranges from -1 to 1, but for text it's usually 0 to 1
+    const confidence = Math.min(bestScore * 1.2, 1) // Slight boost, cap at 1
+
+    if (bestMatch && confidence >= 0.3) {
+      results.push({
+        feedbackId: feedback.id,
+        productAreaId: bestMatch.id,
+        productAreaName: bestMatch.name,
+        ownerId: bestMatch.owner_id,
+        confidence: confidence,
+        reasoning: `Vector similarity: ${(bestScore * 100).toFixed(0)}%`
+      })
+    } else {
+      results.push({
+        feedbackId: feedback.id,
+        productAreaId: null,
+        ownerId: null,
+        confidence: confidence,
+        reasoning: 'No confident match'
+      })
+    }
+  }
+
+  return results
 }

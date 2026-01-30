@@ -4,11 +4,12 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { X, Search, Sparkles, Plus, Archive, Building2, DollarSign, Calendar, User, Tag, Check, Loader2, ArrowRight } from 'lucide-react'
+import { X, Search, Sparkles, Plus, Archive, Building2, DollarSign, Calendar, User, Tag, Check, Loader2, ArrowRight, UserPlus } from 'lucide-react'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { suggestMatchingIdeas, suggestIdeaFromFeedback } from '@/lib/llm'
 import { cn } from '@/lib/utils'
 
-export default function TriagePanel({ feedback, isOpen, onClose, onComplete }) {
+export default function TriagePanel({ feedback, isOpen, onClose, onComplete, teamMembers = [], productAreas = [], currentUser = null }) {
   const [ideas, setIdeas] = useState([])
   const [searchQuery, setSearchQuery] = useState('')
   const [aiSuggestions, setAiSuggestions] = useState(null)
@@ -114,6 +115,10 @@ export default function TriagePanel({ feedback, isOpen, onClose, onComplete }) {
       })
       
       await supabase.from('feedback_idea_links').insert(links)
+      
+      // Update feedback status to triaged
+      await supabase.from('feedback').update({ triage_status: 'triaged' }).eq('id', feedback.id)
+      
       onComplete?.()
     } catch (error) {
       console.error('Failed to link:', error)
@@ -143,6 +148,10 @@ export default function TriagePanel({ feedback, isOpen, onClose, onComplete }) {
           feedback_id: feedback.id,
           idea_id: newIdea.id,
         })
+        
+        // Update feedback status to triaged
+        await supabase.from('feedback').update({ triage_status: 'triaged' }).eq('id', feedback.id)
+        
         onComplete?.()
       }
     } catch (error) {
@@ -202,12 +211,12 @@ export default function TriagePanel({ feedback, isOpen, onClose, onComplete }) {
       {/* Slide-out Panel */}
       <div
         className={cn(
-          "fixed right-0 top-0 h-full w-[600px] max-w-[90vw] bg-background border-l shadow-2xl z-50 transform transition-transform duration-300 ease-in-out flex flex-col",
+          "fixed right-0 top-0 bottom-0 w-[500px] max-w-[90vw] bg-background border-l shadow-2xl z-50 transform transition-transform duration-300 ease-in-out flex flex-col",
           isOpen ? "translate-x-0" : "translate-x-full"
         )}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b">
+        <div className="flex items-center justify-between px-6 py-4 border-b bg-background flex-shrink-0">
           <h2 className="text-lg font-semibold tracking-tight">Triage Feedback</h2>
           <Button variant="ghost" size="icon" onClick={onClose} className="h-8 w-8">
             <X className="h-4 w-4" />
@@ -215,35 +224,163 @@ export default function TriagePanel({ feedback, isOpen, onClose, onComplete }) {
         </div>
 
         {/* Scrollable Content */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5 min-h-0">
           
-          {/* Customer & ARR Badge */}
-          <div className="flex items-center gap-3 p-3 bg-muted/50 rounded-lg">
-            <Building2 className="h-5 w-5 text-muted-foreground" />
-            <span className="font-semibold">{feedback.account_name || 'Unknown Account'}</span>
-            {feedback.account_segment && (
-              <Badge variant="outline">{feedback.account_segment}</Badge>
-            )}
-            {formatCurrency(feedback.account_arr) && (
-              <span className="text-green-600 font-semibold ml-auto">
-                {formatCurrency(feedback.account_arr)} ARR
-              </span>
-            )}
-          </div>
-          
-          {/* Title */}
-          <div>
-            <h3 className="text-xl font-semibold text-foreground leading-tight">
-              {displayTitle}
-            </h3>
+          {/* Feedback Details Card */}
+          <div className="rounded-lg border bg-card">
+            {/* Header with Account */}
+            <div className="flex items-center gap-3 p-4 border-b bg-muted/30">
+              <Building2 className="h-5 w-5 text-muted-foreground flex-shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="font-semibold truncate">{feedback.account_name || 'Unknown Account'}</p>
+                <div className="flex items-center gap-2 mt-0.5">
+                  {feedback.account_segment && (
+                    <span className="text-xs text-muted-foreground">{feedback.account_segment}</span>
+                  )}
+                  {feedback.account_status && (
+                    <>
+                      <span className="text-muted-foreground/50">·</span>
+                      <span className="text-xs text-muted-foreground">{feedback.account_status}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              {/* ARR Badges */}
+              <div className="flex flex-col items-end gap-1">
+                {formatCurrency(feedback.account_arr) && (
+                  <span className="text-sm font-semibold text-emerald-600">
+                    {formatCurrency(feedback.account_arr)} ARR
+                  </span>
+                )}
+                {formatCurrency(feedback.potential_arr) && (
+                  <span className="text-xs font-medium text-blue-600">
+                    +{formatCurrency(feedback.potential_arr)} Opportunity
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Title */}
+            <div className="px-4 pt-4 pb-2">
+              <h3 className="text-lg font-semibold text-foreground leading-tight">
+                {displayTitle}
+              </h3>
+            </div>
+
+            {/* Description */}
+            <div className="px-4 pb-4">
+              <p className="text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                {feedback.description}
+              </p>
+            </div>
+
+            {/* Metadata Grid */}
+            <div className="grid grid-cols-2 gap-x-4 gap-y-2 px-4 py-3 border-t bg-muted/20 text-sm">
+              {feedback.importance && (
+                <div className="flex items-center gap-2">
+                  <Tag className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-muted-foreground">Importance:</span>
+                  <span className={cn(
+                    "font-medium",
+                    feedback.importance === 'High' && 'text-red-600',
+                    feedback.importance === 'Medium' && 'text-amber-600',
+                    feedback.importance === 'Low' && 'text-muted-foreground'
+                  )}>{feedback.importance}</span>
+                </div>
+              )}
+              {feedback.feedback_date && (
+                <div className="flex items-center gap-2">
+                  <Calendar className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-muted-foreground">Date:</span>
+                  <span className="font-medium">{formatDate(feedback.feedback_date)}</span>
+                </div>
+              )}
+              {feedback.created_by && (
+                <div className="flex items-center gap-2">
+                  <User className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-muted-foreground">Owner:</span>
+                  <span className="font-medium truncate">{feedback.created_by}</span>
+                </div>
+              )}
+              {feedback.source && (
+                <div className="flex items-center gap-2">
+                  <Tag className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-muted-foreground">Source:</span>
+                  <span className="font-medium">{feedback.source}</span>
+                </div>
+              )}
+              {feedback.active_opportunities && (
+                <div className="flex items-center gap-2 col-span-2">
+                  <DollarSign className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-muted-foreground">Open Opps:</span>
+                  <span className="font-medium">{feedback.active_opportunities}</span>
+                </div>
+              )}
+            </div>
           </div>
 
-          {/* Full Description */}
-          <div className="space-y-2">
-            <p className="text-sm text-foreground leading-relaxed whitespace-pre-wrap">
-              {feedback.description}
-            </p>
-          </div>
+          {/* Assignment Section */}
+          {teamMembers.length > 0 && (
+            <div className="space-y-3">
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                Assignment
+              </label>
+              <div className="flex items-center gap-3">
+                <Select 
+                  value={feedback?.assigned_to_id || '__unassigned__'}
+                  onValueChange={async (value) => {
+                    const newAssignee = value === '__unassigned__' ? null : value
+                    await supabase.from('feedback').update({
+                      assigned_to_id: newAssignee,
+                      assigned_at: newAssignee ? new Date().toISOString() : null
+                    }).eq('id', feedback.id)
+                    // Don't close, just refresh
+                  }}
+                >
+                  <SelectTrigger className="flex-1">
+                    <UserPlus className="h-4 w-4 mr-2 text-muted-foreground" />
+                    <SelectValue placeholder="Assign to..." />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__unassigned__">Unassigned</SelectItem>
+                    {teamMembers.map(member => (
+                      <SelectItem key={member.id} value={member.id}>
+                        {member.name}
+                        {currentUser?.id === member.id && ' (me)'}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                
+                {feedback?.suggested_owner_id && feedback?.suggestion_confidence >= 0.5 && !feedback?.assigned_to_id && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="text-purple-600 border-purple-200 bg-purple-50 hover:bg-purple-100 whitespace-nowrap"
+                    onClick={async () => {
+                      await supabase.from('feedback').update({
+                        assigned_to_id: feedback.suggested_owner_id,
+                        assigned_at: new Date().toISOString()
+                      }).eq('id', feedback.id)
+                    }}
+                  >
+                    <Sparkles className="h-3.5 w-3.5 mr-1" />
+                    Accept Suggestion
+                  </Button>
+                )}
+              </div>
+              
+              {/* Show AI suggestion info */}
+              {feedback?.suggested_owner && feedback?.suggestion_confidence >= 0.5 && !feedback?.assigned_to_id && (
+                <p className="text-xs text-purple-600 flex items-center gap-1">
+                  <Sparkles className="h-3 w-3" />
+                  AI suggests: {feedback.suggested_owner.name} ({Math.round(feedback.suggestion_confidence * 100)}% confidence)
+                </p>
+              )}
+            </div>
+          )}
+
+          <div className="h-px bg-border" />
 
           {/* Existing Links */}
           {existingLinks.size > 0 && (
@@ -416,11 +553,11 @@ export default function TriagePanel({ feedback, isOpen, onClose, onComplete }) {
         </div>
 
         {/* Footer */}
-        <div className="border-t px-6 py-4 bg-background">
+        <div className="border-t px-6 py-4 bg-background flex-shrink-0">
           <div className="flex gap-3">
             <Button 
               variant="outline"
-              className="flex-1 text-muted-foreground"
+              className="text-muted-foreground"
               onClick={handleArchive}
             >
               <Archive className="h-4 w-4 mr-2" />

@@ -134,7 +134,7 @@ export default function IdeaDetail({ idea, isOpen, onClose, onUpdate }) {
       const { data: feedback } = await supabase
         .from('feedback')
         .select('*')
-        .in('triage_status', ['new', 'triaged', 'linked'])
+        .in('triage_status', ['new', 'triaged'])
         .limit(100)
       
       // Filter out already linked items

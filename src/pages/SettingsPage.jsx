@@ -3,6 +3,7 @@ import { supabase } from '@/lib/supabase'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Check, AlertCircle, Trash2, Sparkles, Loader2 } from 'lucide-react'
 import { batchEmbedFeedback, batchEmbedIdeas } from '@/lib/embeddings'
 
@@ -14,9 +15,29 @@ export default function SettingsPage() {
   const [isEmbedding, setIsEmbedding] = useState(false)
   const [embeddingProgress, setEmbeddingProgress] = useState(null)
   
-  const llmProvider = import.meta.env.VITE_OPENAI_API_KEY ? 'OpenAI' : 
-                      import.meta.env.VITE_ANTHROPIC_API_KEY ? 'Anthropic' : 
-                      import.meta.env.VITE_GEMINI_API_KEY ? 'Gemini' : null
+  // Get all available providers
+  const availableProviders = [
+    import.meta.env.VITE_GEMINI_API_KEY && { id: 'gemini', name: 'Gemini 2.0 Flash', speed: 'Fastest' },
+    import.meta.env.VITE_OPENAI_API_KEY && { id: 'openai', name: 'GPT-4o Mini', speed: 'Fast' },
+    import.meta.env.VITE_ANTHROPIC_API_KEY && { id: 'anthropic', name: 'Claude 3 Haiku', speed: 'Fast' },
+  ].filter(Boolean)
+  
+  // Get saved preference or default to first available
+  const [selectedProvider, setSelectedProvider] = useState(() => {
+    const saved = localStorage.getItem('llmProvider')
+    if (saved && availableProviders.some(p => p.id === saved)) return saved
+    return availableProviders[0]?.id || null
+  })
+  
+  // Save preference when changed
+  const handleProviderChange = (providerId) => {
+    setSelectedProvider(providerId)
+    localStorage.setItem('llmProvider', providerId)
+    // Trigger a page refresh to apply the change
+    window.location.reload()
+  }
+  
+  const currentProvider = availableProviders.find(p => p.id === selectedProvider)
 
   useEffect(() => {
     fetchEmbeddingStats()
@@ -124,26 +145,61 @@ export default function SettingsPage() {
           <CardDescription>LLM and embedding providers for AI features</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
-            <div>
-              <p className="font-medium">LLM Provider</p>
-              <p className="text-sm text-muted-foreground">
-                {llmProvider ? `Using ${llmProvider}` : 'Not configured'}
+          {availableProviders.length > 0 ? (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">LLM Provider</label>
+                <Badge className="bg-green-100 text-green-700">
+                  <Check className="h-3 w-3 mr-1" />Connected
+                </Badge>
+              </div>
+              
+              {availableProviders.length === 1 ? (
+                <div className="p-3 bg-muted/50 rounded-lg">
+                  <p className="font-medium">{currentProvider?.name}</p>
+                  <p className="text-sm text-muted-foreground">{currentProvider?.speed}</p>
+                </div>
+              ) : (
+                <Select value={selectedProvider} onValueChange={handleProviderChange}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availableProviders.map((provider) => (
+                      <SelectItem key={provider.id} value={provider.id}>
+                        <div className="flex items-center gap-2">
+                          <span>{provider.name}</span>
+                          <Badge variant="secondary" className="text-[10px]">{provider.speed}</Badge>
+                        </div>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+              
+              <p className="text-xs text-muted-foreground">
+                {availableProviders.length > 1 
+                  ? `${availableProviders.length} providers configured. Select which one to use for AI features.`
+                  : 'Add more API keys to .env.local to enable provider switching.'
+                }
               </p>
             </div>
-            {llmProvider ? (
-              <Badge className="bg-green-100 text-green-700">
-                <Check className="h-3 w-3 mr-1" />Connected
-              </Badge>
-            ) : (
-              <Badge variant="secondary">
-                <AlertCircle className="h-3 w-3 mr-1" />Not configured
-              </Badge>
-            )}
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Add to .env.local: VITE_OPENAI_API_KEY, VITE_ANTHROPIC_API_KEY, or VITE_GEMINI_API_KEY
-          </p>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
+                <div>
+                  <p className="font-medium">LLM Provider</p>
+                  <p className="text-sm text-muted-foreground">Not configured</p>
+                </div>
+                <Badge variant="secondary">
+                  <AlertCircle className="h-3 w-3 mr-1" />Not configured
+                </Badge>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                Add to .env.local: VITE_GEMINI_API_KEY, VITE_OPENAI_API_KEY, or VITE_ANTHROPIC_API_KEY
+              </p>
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -206,7 +262,7 @@ export default function SettingsPage() {
                 <div className="pt-2">
                   <Button 
                     onClick={handleGenerateEmbeddings} 
-                    disabled={isEmbedding || !llmProvider}
+                    disabled={isEmbedding || !selectedProvider}
                     className="w-full"
                   >
                     {isEmbedding ? (
@@ -221,7 +277,7 @@ export default function SettingsPage() {
                       </>
                     )}
                   </Button>
-                  {!llmProvider && (
+                  {!selectedProvider && (
                     <p className="text-xs text-muted-foreground mt-2">
                       Configure an API key above to generate embeddings
                     </p>

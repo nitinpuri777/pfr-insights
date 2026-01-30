@@ -2,17 +2,48 @@ import { findSimilarFeedback, findSimilarIdeas, embedIdea, embedFeedback } from 
 
 // Check if we should use the secure API route (production) or direct calls (development)
 function useSecureAPI() {
-  // In production on Vercel, use the API route
-  // In development with VITE_ keys, use direct calls (less secure but convenient)
-  return import.meta.env.PROD && !import.meta.env.VITE_OPENAI_API_KEY
+  // Use API route if:
+  // 1. We're in production AND no VITE_ key is set, OR
+  // 2. Explicitly forced via env var
+  const hasViteKey = import.meta.env.VITE_OPENAI_API_KEY || 
+                     import.meta.env.VITE_ANTHROPIC_API_KEY || 
+                     import.meta.env.VITE_GEMINI_API_KEY
+  return import.meta.env.PROD && !hasViteKey
 }
 
 export function getProvider() {
-  if (useSecureAPI()) return 'api' // Use Vercel API route
+  // In production without frontend keys, use the secure API route
+  if (useSecureAPI()) return 'api'
+  
+  // Check for user's saved preference
+  const savedProvider = localStorage.getItem('llmProvider')
+  if (savedProvider) {
+    // Verify the saved provider has a valid key
+    if (savedProvider === 'gemini' && import.meta.env.VITE_GEMINI_API_KEY) return 'gemini'
+    if (savedProvider === 'openai' && import.meta.env.VITE_OPENAI_API_KEY) return 'openai'
+    if (savedProvider === 'anthropic' && import.meta.env.VITE_ANTHROPIC_API_KEY) return 'anthropic'
+  }
+  
+  // Fall back to first available provider (Gemini preferred)
+  if (import.meta.env.VITE_GEMINI_API_KEY) return 'gemini'
   if (import.meta.env.VITE_OPENAI_API_KEY) return 'openai'
   if (import.meta.env.VITE_ANTHROPIC_API_KEY) return 'anthropic'
-  if (import.meta.env.VITE_GEMINI_API_KEY) return 'gemini'
+  
+  // Last resort: try the API route anyway (might work if OPENAI_API_KEY is set on server)
+  if (import.meta.env.PROD) return 'api'
+  
   return null
+}
+
+// Export for debugging
+export function getProviderDebug() {
+  return {
+    provider: getProvider(),
+    isProd: import.meta.env.PROD,
+    hasViteOpenAI: !!import.meta.env.VITE_OPENAI_API_KEY,
+    hasViteAnthropic: !!import.meta.env.VITE_ANTHROPIC_API_KEY,
+    hasViteGemini: !!import.meta.env.VITE_GEMINI_API_KEY,
+  }
 }
 
 export async function callLLM(messages, provider = null) {
@@ -54,14 +85,41 @@ export async function callLLM(messages, provider = null) {
   }
   
   if (p === 'gemini') {
-    const parts = messages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${import.meta.env.VITE_GEMINI_API_KEY}`, {
+    // Gemini handles system instructions separately
+    const systemMsg = messages.find(m => m.role === 'system')
+    const otherMsgs = messages.filter(m => m.role !== 'system')
+    
+    const contents = otherMsgs.map(m => ({ 
+      role: m.role === 'assistant' ? 'model' : 'user', 
+      parts: [{ text: m.content }] 
+    }))
+    
+    const body = {
+      contents,
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 8192,
+      }
+    }
+    
+    // Add system instruction if present
+    if (systemMsg) {
+      body.systemInstruction = { parts: [{ text: systemMsg.content }] }
+    }
+    
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${import.meta.env.VITE_GEMINI_API_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: parts }),
+      body: JSON.stringify(body),
     })
     const data = await res.json()
-    return data.candidates[0].content.parts[0].text
+    
+    if (data.error) {
+      console.error('Gemini error:', data.error)
+      throw new Error(data.error.message || 'Gemini API error')
+    }
+    
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || ''
   }
 }
 
@@ -422,6 +480,233 @@ Return JSON: {"title":"Short idea title","description":"What this would enable..
       description: ''
     }
   }
+}
+
+/**
+ * Suggest which PM/product area should own a piece of feedback
+ */
+export async function suggestFeedbackOwner(feedback, productAreas) {
+  if (!productAreas || productAreas.length === 0) {
+    return { productAreaId: null, ownerId: null, confidence: 0, reasoning: 'No product areas configured' }
+  }
+
+  const areasContext = productAreas.map(area => `
+### ${area.name}
+- ID: ${area.id}
+- Owner ID: ${area.owner_id}
+- Description: ${area.description || 'No description'}
+- Keywords: ${area.keywords?.join(', ') || 'None'}
+`).join('\n')
+
+  const messages = [
+    {
+      role: 'system',
+      content: `You are a product feedback routing assistant. Given customer feedback and a list of product areas, determine which area this feedback belongs to.
+
+## Product Areas
+${areasContext}
+
+## Instructions
+Analyze the feedback and find the best matching product area. Consider:
+1. Keyword matches (exact and semantic)
+2. The functionality or feature being discussed
+3. The user's intent
+
+Return JSON only:
+{
+  "productAreaId": "<id of best match or null if no good match>",
+  "ownerId": "<owner_id of matched area or null>",
+  "confidence": <0.0-1.0>,
+  "reasoning": "<one sentence explanation>"
+}
+
+Only return a match if confidence >= 0.5. Otherwise return nulls.`
+    },
+    {
+      role: 'user',
+      content: `Route this feedback:
+
+Title: ${feedback.title || 'Untitled'}
+Description: ${feedback.description || ''}
+Account: ${feedback.account_name || 'Unknown'}`
+    }
+  ]
+
+  try {
+    const response = await callLLM(messages)
+    const match = response.match(/\{[\s\S]*\}/)
+    const result = JSON.parse(match[0])
+    
+    // Validate the result
+    if (result.confidence >= 0.5 && result.productAreaId) {
+      // Verify the product area exists
+      const area = productAreas.find(a => a.id === result.productAreaId)
+      if (area) {
+        return {
+          productAreaId: result.productAreaId,
+          ownerId: area.owner_id,
+          confidence: result.confidence,
+          reasoning: result.reasoning
+        }
+      }
+    }
+    
+    return { productAreaId: null, ownerId: null, confidence: result.confidence || 0, reasoning: result.reasoning || 'No confident match' }
+  } catch (error) {
+    console.error('Failed to suggest owner:', error)
+    return { productAreaId: null, ownerId: null, confidence: 0, reasoning: 'AI suggestion failed' }
+  }
+}
+
+/**
+ * Batch suggest owners for multiple feedback items
+ * Processes items in batches of 10 per LLM call for efficiency
+ */
+export async function batchSuggestOwners(feedbackItems, productAreas, options = {}) {
+  const { batchSize = 100 } = options  // 100 items per API call - within token limits (~10K tokens)
+  
+  if (!productAreas || productAreas.length === 0) {
+    return feedbackItems.map(f => ({ 
+      feedbackId: f.id, 
+      productAreaId: null, 
+      ownerId: null, 
+      confidence: 0, 
+      reasoning: 'No product areas configured' 
+    }))
+  }
+
+  const areasContext = productAreas.map(area => `
+### ${area.name}
+- ID: ${area.id}
+- Owner ID: ${area.owner_id}
+- Description: ${area.description || 'No description'}
+- Keywords: ${area.keywords?.join(', ') || 'None'}`).join('\n')
+
+  const results = []
+  
+  // Process in batches
+  for (let i = 0; i < feedbackItems.length; i += batchSize) {
+    const batch = feedbackItems.slice(i, i + batchSize)
+    
+    // Build the feedback list for this batch
+    const feedbackList = batch.map((f, idx) => `
+[${idx + 1}] ID: ${f.id}
+    Account: ${f.account_name || 'Unknown'}
+    Title: ${f.title || 'Untitled'}
+    Description: ${f.description?.slice(0, 200) || 'No description'}
+`).join('\n')
+
+    const messages = [
+      {
+        role: 'system',
+        content: `You are a product feedback routing assistant. Route each feedback item to the most appropriate product area.
+
+## Product Areas
+${areasContext}
+
+## Instructions
+For each feedback item, determine the best matching product area. Consider:
+1. Keyword matches (exact and semantic)
+2. The functionality or feature being discussed
+3. The user's intent
+
+Return a JSON array with one object per feedback item, in the same order:
+[
+  {
+    "id": "<feedback id>",
+    "productAreaId": "<id of best match or null>",
+    "ownerId": "<owner_id of matched area or null>",
+    "confidence": <0.0-1.0>,
+    "reasoning": "<brief explanation>"
+  },
+  ...
+]
+
+Be strict with confidence scores:
+- 0.8+ = Strong keyword/semantic match
+- 0.5-0.8 = Related but not perfect match
+- Below 0.5 = Weak or no match (return null for productAreaId)`
+      },
+      {
+        role: 'user',
+        content: `Route these ${batch.length} feedback items:\n${feedbackList}`
+      }
+    ]
+
+    try {
+      console.log(`Sending batch of ${batch.length} items to LLM...`)
+      const response = await callLLM(messages)
+      console.log('LLM response received, length:', response?.length || 0)
+      
+      const match = response.match(/\[[\s\S]*\]/)
+      if (!match) {
+        console.error('Could not parse JSON array from response:', response?.slice(0, 500))
+        // Add empty results for this batch
+        for (const f of batch) {
+          results.push({
+            feedbackId: f.id,
+            productAreaId: null,
+            ownerId: null,
+            confidence: 0,
+            reasoning: 'Could not parse LLM response'
+          })
+        }
+        continue
+      }
+      
+      const batchResults = JSON.parse(match[0])
+      console.log(`Parsed ${batchResults.length} results from LLM`)
+      
+      for (const result of batchResults) {
+        // Find the feedback item
+        const feedbackItem = batch.find(f => f.id === result.id)
+        if (!feedbackItem) continue
+        
+        // Validate and normalize result
+        if (result.confidence >= 0.3 && result.productAreaId) {
+          const area = productAreas.find(a => a.id === result.productAreaId)
+          if (area) {
+            results.push({
+              feedbackId: result.id,
+              productAreaId: result.productAreaId,
+              ownerId: area.owner_id,
+              confidence: result.confidence,
+              reasoning: result.reasoning
+            })
+            continue
+          }
+        }
+        
+        // No match or invalid
+        results.push({
+          feedbackId: result.id,
+          productAreaId: null,
+          ownerId: null,
+          confidence: result.confidence || 0,
+          reasoning: result.reasoning || 'No confident match'
+        })
+      }
+    } catch (error) {
+      console.error('Batch suggestion failed:', error)
+      // Add empty results for this batch
+      for (const f of batch) {
+        results.push({
+          feedbackId: f.id,
+          productAreaId: null,
+          ownerId: null,
+          confidence: 0,
+          reasoning: 'Processing error'
+        })
+      }
+    }
+    
+    // Small delay between batches to avoid rate limits
+    if (i + batchSize < feedbackItems.length) {
+      await new Promise(r => setTimeout(r, 300))
+    }
+  }
+  
+  return results
 }
 
 // Re-export embedding functions for convenience
