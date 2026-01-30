@@ -7,9 +7,9 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
-import { Plus, MessageSquare, Search, ArrowUpDown, DollarSign, Users, TrendingUp, Building2, Sparkles, Check, Loader2 } from 'lucide-react'
+import { Plus, MessageSquare, Search, ArrowUpDown, DollarSign, Users, TrendingUp, Building2, Sparkles, Check, Loader2, Lightbulb } from 'lucide-react'
 import IdeaDetail from '@/components/IdeaDetail'
-import { findEvidenceForIdea, embedIdea } from '@/lib/llm'
+import { findEvidenceForIdea, embedIdea, generateIdeasFromFeedback } from '@/lib/llm'
 import { cn } from '@/lib/utils'
 
 const STATUS_CONFIG = {
@@ -50,6 +50,13 @@ export default function IdeasPage() {
   const [isSearchingEvidence, setIsSearchingEvidence] = useState(false)
   const [selectedEvidence, setSelectedEvidence] = useState(new Set())
   const [isLinkingEvidence, setIsLinkingEvidence] = useState(false)
+  
+  // Generate ideas state
+  const [isGenerateModalOpen, setIsGenerateModalOpen] = useState(false)
+  const [isGeneratingIdeas, setIsGeneratingIdeas] = useState(false)
+  const [suggestedIdeas, setSuggestedIdeas] = useState([])
+  const [selectedSuggestions, setSelectedSuggestions] = useState(new Set())
+  const [isCreatingSuggested, setIsCreatingSuggested] = useState(false)
 
   useEffect(() => { fetchIdeas() }, [])
 
@@ -195,6 +202,133 @@ export default function IdeasPage() {
     setSelectedEvidence(new Set(matching.map(m => m.id)))
   }
 
+  // Generate Ideas from unlinked feedback
+  const handleGenerateIdeasLLM = async () => {
+    setIsGenerateModalOpen(true)
+    setIsGeneratingIdeas(true)
+    setSuggestedIdeas([])
+    setSelectedSuggestions(new Set())
+    
+    try {
+      // Fetch unlinked feedback (feedback not linked to any idea)
+      const { data: allFeedback } = await supabase
+        .from('feedback')
+        .select('*')
+        .in('triage_status', ['new', 'triaged'])
+        .order('account_arr', { ascending: false })
+        .limit(100)
+      
+      // Get existing links to filter out already-linked feedback
+      const { data: existingLinks } = await supabase
+        .from('feedback_idea_links')
+        .select('feedback_id')
+      
+      const linkedIds = new Set((existingLinks || []).map(l => l.feedback_id))
+      const unlinkedFeedback = (allFeedback || []).filter(f => !linkedIds.has(f.id))
+      
+      if (unlinkedFeedback.length < 3) {
+        alert('Not enough unlinked feedback to generate ideas. Need at least 3 items.')
+        setIsGeneratingIdeas(false)
+        return
+      }
+      
+      console.log(`Generating ideas from ${unlinkedFeedback.length} unlinked feedback items...`)
+      
+      const suggestions = await generateIdeasFromFeedback(unlinkedFeedback, ideas)
+      
+      // Enrich suggestions with feedback details
+      const enrichedSuggestions = suggestions.map(s => ({
+        ...s,
+        feedbackItems: s.feedbackIds.map(id => unlinkedFeedback.find(f => f.id === id)).filter(Boolean),
+        totalArr: s.feedbackIds.reduce((sum, id) => {
+          const f = unlinkedFeedback.find(fb => fb.id === id)
+          return sum + (parseFloat(f?.account_arr) || 0)
+        }, 0)
+      }))
+      
+      setSuggestedIdeas(enrichedSuggestions)
+      // Auto-select high priority suggestions
+      setSelectedSuggestions(new Set(
+        enrichedSuggestions.filter(s => s.priority === 'high').map((_, i) => i)
+      ))
+      
+    } catch (error) {
+      console.error('Failed to generate ideas:', error)
+      alert('Failed to generate ideas. Check console for details.')
+    }
+    
+    setIsGeneratingIdeas(false)
+  }
+  
+  const toggleSuggestionSelected = (index) => {
+    setSelectedSuggestions(prev => {
+      const next = new Set(prev)
+      if (next.has(index)) next.delete(index)
+      else next.add(index)
+      return next
+    })
+  }
+  
+  const handleCreateSuggestedIdeas = async () => {
+    const toCreate = suggestedIdeas.filter((_, i) => selectedSuggestions.has(i))
+    if (toCreate.length === 0) return
+    
+    setIsCreatingSuggested(true)
+    
+    try {
+      for (const suggestion of toCreate) {
+        // Create the idea
+        const { data: newIdea, error: ideaError } = await supabase
+          .from('ideas')
+          .insert({
+            title: suggestion.title,
+            description: suggestion.description,
+            status: 'under_consideration',
+          })
+          .select()
+          .single()
+        
+        if (ideaError || !newIdea) {
+          console.error('Failed to create idea:', ideaError)
+          continue
+        }
+        
+        // Link feedback items
+        if (suggestion.feedbackIds.length > 0) {
+          const links = suggestion.feedbackIds.map(feedbackId => ({
+            feedback_id: feedbackId,
+            idea_id: newIdea.id,
+          }))
+          
+          await supabase.from('feedback_idea_links').insert(links)
+          
+          // Update feedback status to triaged
+          await supabase
+            .from('feedback')
+            .update({ triage_status: 'triaged' })
+            .in('id', suggestion.feedbackIds)
+        }
+        
+        // Generate embedding for the idea
+        try {
+          await embedIdea(newIdea.id, newIdea.title, newIdea.description)
+        } catch (e) {
+          console.log('Could not generate embedding:', e)
+        }
+      }
+      
+      setIsGenerateModalOpen(false)
+      setSuggestedIdeas([])
+      setSelectedSuggestions(new Set())
+      fetchIdeas()
+      
+    } catch (error) {
+      console.error('Failed to create ideas:', error)
+    }
+    
+    setIsCreatingSuggested(false)
+  }
+
   const filteredIdeas = ideas
     .filter((idea) => {
       const matchesSearch = 
@@ -238,13 +372,21 @@ export default function IdeasPage() {
             {ideas.length} ideas · {totalRequests} requests · {formatCurrency(totalARR)} total ARR
           </p>
         </div>
-        <Dialog open={isCreateOpen} onOpenChange={(open) => {
-          if (!open) handleCloseCreateDialog()
-          else setIsCreateOpen(true)
-        }}>
-          <DialogTrigger asChild>
-            <Button><Plus className="h-4 w-4 mr-2" />New Idea</Button>
-          </DialogTrigger>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={handleGenerateIdeasLLM} disabled={isGeneratingIdeas}>
+            {isGeneratingIdeas ? (
+              <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Analyzing...</>
+            ) : (
+              <><Lightbulb className="h-4 w-4 mr-2" />Generate Ideas</>
+            )}
+          </Button>
+          <Dialog open={isCreateOpen} onOpenChange={(open) => {
+            if (!open) handleCloseCreateDialog()
+            else setIsCreateOpen(true)
+          }}>
+            <DialogTrigger asChild>
+              <Button><Plus className="h-4 w-4 mr-2" />New Idea</Button>
+            </DialogTrigger>
           <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
             {!createdIdea ? (
               // Step 1: Create Idea Form
@@ -413,7 +555,166 @@ export default function IdeasPage() {
             )}
           </DialogContent>
         </Dialog>
+        </div>
       </div>
+
+      {/* Generate Ideas Modal */}
+      <Dialog open={isGenerateModalOpen} onOpenChange={setIsGenerateModalOpen}>
+        <DialogContent className="max-w-3xl max-h-[85vh] flex flex-col">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Lightbulb className="h-5 w-5 text-amber-500" />
+              AI-Generated Ideas
+              {!isGeneratingIdeas && suggestedIdeas.length > 0 && (
+                <Badge variant="outline" className="ml-2">{suggestedIdeas.length} suggestions</Badge>
+              )}
+            </DialogTitle>
+            <DialogDescription>
+              {isGeneratingIdeas 
+                ? 'Analyzing unlinked feedback to identify feature opportunities...'
+                : 'Review AI-suggested ideas based on patterns in your feedback. Select the ones you want to create.'
+              }
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="flex-1 overflow-y-auto py-4 space-y-4 min-h-0">
+            {isGeneratingIdeas && (
+              <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                <Loader2 className="h-8 w-8 animate-spin mb-3" />
+                <p className="text-sm">Analyzing feedback patterns...</p>
+                <p className="text-xs mt-1">This may take 10-20 seconds</p>
+              </div>
+            )}
+            
+            {!isGeneratingIdeas && suggestedIdeas.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                <Lightbulb className="h-8 w-8 mb-3" />
+                <p className="text-sm">No ideas could be generated</p>
+                <p className="text-xs mt-1">Try adding more feedback items first</p>
+              </div>
+            )}
+            
+            {suggestedIdeas.map((suggestion, index) => (
+              <div
+                key={index}
+                className={cn(
+                  "p-4 rounded-lg border cursor-pointer transition-colors",
+                  selectedSuggestions.has(index) 
+                    ? "bg-amber-50 border-amber-200" 
+                    : "hover:bg-muted/50"
+                )}
+                onClick={() => toggleSuggestionSelected(index)}
+              >
+                <div className="flex items-start gap-3">
+                  {/* Checkbox */}
+                  <div className={cn(
+                    "w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 mt-0.5",
+                    selectedSuggestions.has(index) 
+                      ? "bg-amber-500 border-amber-500 text-white" 
+                      : "border-muted-foreground/30"
+                  )}>
+                    {selectedSuggestions.has(index) && <Check className="h-3 w-3" />}
+                  </div>
+                  
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <h3 className="font-semibold">{suggestion.title}</h3>
+                      <Badge 
+                        variant="secondary"
+                        className={cn(
+                          "text-xs",
+                          suggestion.priority === 'high' && "bg-red-100 text-red-700",
+                          suggestion.priority === 'medium' && "bg-amber-100 text-amber-700",
+                          suggestion.priority === 'low' && "bg-gray-100 text-gray-600"
+                        )}
+                      >
+                        {suggestion.priority}
+                      </Badge>
+                    </div>
+                    
+                    <p className="text-sm text-muted-foreground mb-3">
+                      {suggestion.description}
+                    </p>
+                    
+                    {/* Stats */}
+                    <div className="flex items-center gap-4 text-sm mb-3">
+                      <span className="flex items-center gap-1 text-blue-600">
+                        <MessageSquare className="h-3.5 w-3.5" />
+                        {suggestion.feedbackCount} requests
+                      </span>
+                      {suggestion.totalArr > 0 && (
+                        <span className="flex items-center gap-1 text-emerald-600">
+                          <DollarSign className="h-3.5 w-3.5" />
+                          {formatCurrency(suggestion.totalArr)} ARR
+                        </span>
+                      )}
+                    </div>
+                    
+                    {/* Linked Feedback Preview */}
+                    <div className="space-y-1">
+                      <p className="text-xs font-medium text-muted-foreground">Linked Feedback:</p>
+                      {suggestion.feedbackItems?.slice(0, 3).map((f, i) => (
+                        <div key={i} className="text-xs text-muted-foreground flex items-center gap-2">
+                          <Building2 className="h-3 w-3 flex-shrink-0" />
+                          <span className="font-medium">{f.account_name}</span>
+                          <span className="truncate">- {f.title || f.description?.slice(0, 50)}</span>
+                        </div>
+                      ))}
+                      {suggestion.feedbackItems?.length > 3 && (
+                        <p className="text-xs text-muted-foreground">
+                          +{suggestion.feedbackItems.length - 3} more
+                        </p>
+                      )}
+                    </div>
+                    
+                    {/* Reasoning */}
+                    {suggestion.reasoning && (
+                      <p className="text-xs text-purple-600 mt-2 italic">
+                        "{suggestion.reasoning}"
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          
+          {suggestedIdeas.length > 0 && (
+            <DialogFooter className="border-t pt-4">
+              <div className="flex items-center gap-2 mr-auto">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSelectedSuggestions(new Set(suggestedIdeas.map((_, i) => i)))}
+                >
+                  Select All
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSelectedSuggestions(new Set())}
+                >
+                  Clear
+                </Button>
+              </div>
+              <Button variant="outline" onClick={() => setIsGenerateModalOpen(false)}>
+                Cancel
+              </Button>
+              <Button 
+                onClick={handleCreateSuggestedIdeas}
+                disabled={selectedSuggestions.size === 0 || isCreatingSuggested}
+                className="bg-amber-500 hover:bg-amber-600"
+              >
+                {isCreatingSuggested ? (
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Creating...</>
+                ) : (
+                  <>Create {selectedSuggestions.size} Ideas</>
+                )}
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
 
       {/* Filters */}
       <div className="flex gap-4 flex-wrap">

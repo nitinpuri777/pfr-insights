@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '@/lib/supabase'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { MessageSquare, Lightbulb, CheckCircle, DollarSign, TrendingUp, Link, Building2 } from 'lucide-react'
 
 export default function InsightsPage() {
@@ -13,8 +13,8 @@ export default function InsightsPage() {
     linkedPotentialARR: 0,
     totalCustomers: 0,
   })
-  const [topIdeas, setTopIdeas] = useState([])
-  const [statusBreakdown, setStatusBreakdown] = useState([])
+  const [allIdeas, setAllIdeas] = useState([])
+  const [sortBy, setSortBy] = useState('arr')
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
@@ -54,34 +54,6 @@ export default function InsightsPage() {
           linkedPotentialARR += potentialArr
         })
         
-        // Status breakdown
-        const statusCounts = {}
-        ideas.forEach(i => {
-          statusCounts[i.status] = (statusCounts[i.status] || 0) + 1
-        })
-        const statusLabels = {
-          backlog: 'Backlog',
-          under_consideration: 'Under Consideration',
-          planned: 'Planned',
-          in_progress: 'In Progress',
-          shipped: 'Shipped',
-          wont_do: "Won't Do",
-        }
-        const breakdown = Object.entries(statusCounts).map(([status, count]) => ({
-          status,
-          label: statusLabels[status] || status,
-          count,
-        })).sort((a, b) => {
-          const order = ['backlog', 'under_consideration', 'planned', 'in_progress', 'shipped', 'wont_do']
-          return order.indexOf(a.status) - order.indexOf(b.status)
-        })
-        
-        // Top ideas by ARR (already computed in ideas table)
-        const rankedIdeas = ideas
-          .filter(i => (i.total_arr || 0) > 0)
-          .sort((a, b) => (b.total_arr || 0) - (a.total_arr || 0))
-          .slice(0, 10)
-        
         setStats({
           totalFeedback,
           percentTriaged,
@@ -90,8 +62,7 @@ export default function InsightsPage() {
           linkedPotentialARR,
           totalCustomers: linkedAccounts.size,
         })
-        setTopIdeas(rankedIdeas)
-        setStatusBreakdown(breakdown)
+        setAllIdeas(ideas)
       }
       
       setIsLoading(false)
@@ -105,6 +76,23 @@ export default function InsightsPage() {
     if (num >= 1000) return `$${Math.round(num / 1000)}K`
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(num)
   }
+
+  // Sort ideas based on selected option
+  const getSortedIdeas = () => {
+    let sorted = [...allIdeas]
+    if (sortBy === 'arr') {
+      sorted = sorted
+        .filter(i => (i.total_arr || 0) > 0)
+        .sort((a, b) => (b.total_arr || 0) - (a.total_arr || 0))
+    } else if (sortBy === 'count') {
+      sorted = sorted
+        .filter(i => (i.feedback_count || 0) > 0)
+        .sort((a, b) => (b.feedback_count || 0) - (a.feedback_count || 0))
+    }
+    return sorted.slice(0, 10)
+  }
+
+  const topIdeas = getSortedIdeas()
 
   if (isLoading) {
     return (
@@ -208,30 +196,24 @@ export default function InsightsPage() {
         </Card>
       </div>
 
-      {/* Status Breakdown */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">Ideas by Status</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-wrap gap-3">
-            {statusBreakdown.map(({ status, label, count }) => (
-              <div key={status} className="flex items-center gap-2 px-4 py-2 bg-muted rounded-lg">
-                <span className="text-sm font-medium">{label}</span>
-                <Badge variant="secondary">{count}</Badge>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
-
       {/* Top Ideas */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg flex items-center gap-2">
-            <Link className="h-5 w-5" />
-            Top Ideas by ARR Impact
-          </CardTitle>
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-lg flex items-center gap-2">
+              <Link className="h-5 w-5" />
+              Top Ideas
+            </CardTitle>
+            <Select value={sortBy} onValueChange={setSortBy}>
+              <SelectTrigger className="w-[180px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="arr">by ARR Impact</SelectItem>
+                <SelectItem value="count">by Item Count</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </CardHeader>
         <CardContent>
           {topIdeas.length === 0 ? (

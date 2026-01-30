@@ -351,6 +351,118 @@ function cosineSimilarity(a, b) {
 }
 
 /**
+ * Cluster feedback items using vector similarity
+ * Groups semantically similar feedback together
+ * 
+ * @param {Array} feedbackItems - Array of feedback with embeddings
+ * @param {Object} options - Clustering options
+ * @returns {Array} - Array of clusters, each with feedbackIds and items
+ */
+export async function clusterFeedbackByEmbeddings(feedbackItems, options = {}) {
+  const {
+    similarityThreshold = 0.65, // How similar items need to be to cluster
+    minClusterSize = 2,         // Minimum items per cluster
+  } = options
+
+  // Separate items with and without embeddings
+  const itemsWithEmbeddings = []
+  const itemsWithoutEmbeddings = []
+  
+  for (const item of feedbackItems) {
+    if (item.embedding && Array.isArray(item.embedding)) {
+      itemsWithEmbeddings.push(item)
+    } else {
+      itemsWithoutEmbeddings.push(item)
+    }
+  }
+
+  console.log(`Clustering: ${itemsWithEmbeddings.length} items with embeddings, ${itemsWithoutEmbeddings.length} without`)
+
+  if (itemsWithEmbeddings.length < minClusterSize) {
+    console.warn('Not enough items with embeddings to cluster')
+    return { clusters: [], unclustered: feedbackItems, needsEmbeddings: itemsWithoutEmbeddings.length }
+  }
+
+  // Build similarity matrix
+  const n = itemsWithEmbeddings.length
+  const similarities = []
+  
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const sim = cosineSimilarity(
+        itemsWithEmbeddings[i].embedding,
+        itemsWithEmbeddings[j].embedding
+      )
+      if (sim >= similarityThreshold) {
+        similarities.push({ i, j, similarity: sim })
+      }
+    }
+  }
+
+  // Sort by similarity (highest first)
+  similarities.sort((a, b) => b.similarity - a.similarity)
+
+  // Greedy clustering - assign items to clusters
+  const assigned = new Set()
+  const clusters = []
+
+  for (const { i, j, similarity } of similarities) {
+    if (assigned.has(i) && assigned.has(j)) continue
+    
+    // Find or create cluster
+    let cluster = clusters.find(c => c.indices.has(i) || c.indices.has(j))
+    
+    if (!cluster) {
+      cluster = { indices: new Set(), avgSimilarity: 0 }
+      clusters.push(cluster)
+    }
+    
+    cluster.indices.add(i)
+    cluster.indices.add(j)
+    assigned.add(i)
+    assigned.add(j)
+  }
+
+  // Convert indices to actual items and calculate stats
+  const result = clusters
+    .filter(c => c.indices.size >= minClusterSize)
+    .map(cluster => {
+      const indices = Array.from(cluster.indices)
+      const items = indices.map(i => itemsWithEmbeddings[i])
+      const feedbackIds = items.map(item => item.id)
+      
+      // Calculate total ARR
+      const totalArr = items.reduce((sum, item) => 
+        sum + (parseFloat(item.account_arr) || 0), 0
+      )
+      
+      // Get unique accounts
+      const uniqueAccounts = new Set(items.map(i => i.account_name).filter(Boolean)).size
+
+      return {
+        feedbackIds,
+        items,
+        size: items.length,
+        totalArr,
+        uniqueAccounts,
+      }
+    })
+    .sort((a, b) => b.size - a.size) // Sort by cluster size
+
+  // Find unclustered items
+  const unclustered = itemsWithEmbeddings.filter((_, i) => !assigned.has(i))
+    .concat(itemsWithoutEmbeddings)
+
+  console.log(`Found ${result.length} clusters from ${itemsWithEmbeddings.length} items`)
+  
+  return { 
+    clusters: result, 
+    unclustered,
+    needsEmbeddings: itemsWithoutEmbeddings.length
+  }
+}
+
+/**
  * Match feedback items to product areas using vector similarity
  * This is the FAST alternative to LLM-based routing
  * 

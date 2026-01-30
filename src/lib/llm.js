@@ -709,5 +709,206 @@ Be strict with confidence scores:
   return results
 }
 
+/**
+ * Generate idea suggestions from unlinked feedback
+ * Analyzes feedback items and clusters them into potential feature ideas
+ */
+export async function generateIdeasFromFeedback(feedbackItems, existingIdeas = []) {
+  if (!feedbackItems || feedbackItems.length === 0) {
+    return []
+  }
+
+  // Build context of existing ideas to avoid duplicates
+  const existingIdeasContext = existingIdeas.length > 0 
+    ? `\n\n## Existing Ideas (DO NOT suggest duplicates)\n${existingIdeas.map(i => `- ${i.title}`).join('\n')}`
+    : ''
+
+  // Build index-to-ID mapping for later conversion
+  const indexToId = {}
+  feedbackItems.forEach((f, idx) => {
+    indexToId[idx + 1] = f.id
+    indexToId[String(idx + 1)] = f.id
+  })
+
+  // Build feedback list with simple numeric indices
+  const feedbackList = feedbackItems.map((f, idx) => `
+[${idx + 1}] Account: ${f.account_name || 'Unknown'} (${f.account_arr ? `$${(f.account_arr / 1000).toFixed(0)}K ARR` : 'No ARR'})
+    Title: ${f.title || 'Untitled'}
+    Description: ${f.description?.slice(0, 300) || 'No description'}
+`).join('\n')
+
+  const messages = [
+    {
+      role: 'system',
+      content: `You are a product manager analyzing customer feedback to identify feature opportunities.
+
+Your task: Analyze the feedback items and suggest new product ideas/features that would address multiple customer requests.
+
+## Guidelines
+1. Look for PATTERNS - ideas that would satisfy 2+ feedback items are most valuable
+2. Be SPECIFIC - "Offline Mode for Field Technicians" is better than "Mobile Improvements"
+3. Prioritize by IMPACT - ideas with more linked feedback and higher ARR are better
+4. Avoid DUPLICATES - don't suggest ideas that already exist
+${existingIdeasContext}
+
+## Output Format
+Return a JSON array of suggested ideas:
+[
+  {
+    "title": "Clear, specific feature name",
+    "description": "2-3 sentence description of what this feature would do",
+    "feedbackNumbers": [1, 2, 5],  // The [N] numbers of feedback items this addresses
+    "reasoning": "Why this is valuable (mention customer count, ARR if relevant)",
+    "priority": "high" | "medium" | "low"
+  },
+  ...
+]
+
+IMPORTANT: Use the [N] numbers from the feedback list for feedbackNumbers, not any other IDs.
+Return 3-7 ideas, sorted by priority (highest first). Only suggest ideas with 2+ linked feedback items.`
+    },
+    {
+      role: 'user',
+      content: `Analyze these ${feedbackItems.length} feedback items and suggest new feature ideas:\n${feedbackList}`
+    }
+  ]
+
+  try {
+    console.log(`Generating ideas from ${feedbackItems.length} feedback items...`)
+    const response = await callLLM(messages)
+    
+    const match = response.match(/\[[\s\S]*\]/)
+    if (!match) {
+      console.error('Could not parse ideas from response:', response?.slice(0, 500))
+      return []
+    }
+    
+    const ideas = JSON.parse(match[0])
+    console.log(`Generated ${ideas.length} idea suggestions`)
+    
+    // Map feedback numbers back to real IDs and validate
+    return ideas.map(idea => {
+      // Support both feedbackNumbers (new) and feedbackIds (old) for backwards compatibility
+      const numbers = idea.feedbackNumbers || idea.feedbackIds || []
+      const realIds = numbers
+        .map(n => indexToId[n] || indexToId[String(n)])
+        .filter(Boolean)
+      
+      console.log(`Idea "${idea.title}": mapped ${numbers.length} numbers to ${realIds.length} IDs`)
+      
+      return {
+        ...idea,
+        feedbackIds: realIds,
+        feedbackCount: realIds.length
+      }
+    }).filter(idea => idea.feedbackIds.length >= 2) // Only ideas with 2+ feedback
+    
+  } catch (error) {
+    console.error('Failed to generate ideas:', error)
+    return []
+  }
+}
+
+/**
+ * Generate idea names and descriptions from pre-clustered feedback
+ * This is Stage 2 of the embedding-based approach
+ */
+export async function nameClusteredIdeas(clusters, existingIdeas = []) {
+  if (!clusters || clusters.length === 0) {
+    return []
+  }
+
+  // Build context of existing ideas to avoid duplicates
+  const existingIdeasContext = existingIdeas.length > 0 
+    ? `\n\n## Existing Ideas (DO NOT suggest names similar to these)\n${existingIdeas.map(i => `- ${i.title}`).join('\n')}`
+    : ''
+
+  // Build cluster descriptions
+  const clusterDescriptions = clusters.map((cluster, idx) => {
+    const samples = cluster.items.slice(0, 5).map(f => 
+      `  - ${f.account_name || 'Unknown'}: "${f.title || f.description?.slice(0, 100) || 'No title'}"`
+    ).join('\n')
+    
+    return `
+CLUSTER ${idx + 1} (${cluster.size} requests, ${cluster.uniqueAccounts} customers, $${(cluster.totalArr / 1000).toFixed(0)}K ARR):
+${samples}${cluster.size > 5 ? `\n  ... and ${cluster.size - 5} more similar requests` : ''}`
+  }).join('\n')
+
+  const messages = [
+    {
+      role: 'system',
+      content: `You are a product manager naming feature ideas based on clustered customer feedback.
+
+You will receive clusters of similar feedback items that have already been grouped by semantic similarity. Your job is to:
+1. Create a clear, specific feature NAME for each cluster
+2. Write a brief DESCRIPTION (2-3 sentences) of what this feature would do
+3. Assess PRIORITY based on ARR and customer count
+
+${existingIdeasContext}
+
+## Output Format
+Return a JSON array with one entry per cluster:
+[
+  {
+    "clusterIndex": 1,
+    "title": "Clear, specific feature name",
+    "description": "2-3 sentence description of what this feature would do",
+    "priority": "high" | "medium" | "low",
+    "reasoning": "Brief explanation of value"
+  },
+  ...
+]
+
+Be SPECIFIC with names - "Work Order Completion Date Editor" is better than "Date Management".
+Sort by priority (high first).`
+    },
+    {
+      role: 'user',
+      content: `Name and describe these ${clusters.length} feedback clusters:\n${clusterDescriptions}`
+    }
+  ]
+
+  try {
+    console.log(`Naming ${clusters.length} clusters...`)
+    const response = await callLLM(messages)
+    
+    const match = response.match(/\[[\s\S]*\]/)
+    if (!match) {
+      console.error('Could not parse cluster names from response:', response?.slice(0, 500))
+      return []
+    }
+    
+    const named = JSON.parse(match[0])
+    console.log(`Named ${named.length} clusters`)
+    
+    // Merge LLM names with cluster data
+    return named.map(item => {
+      const clusterIdx = (item.clusterIndex || item.cluster_index || 1) - 1
+      const cluster = clusters[clusterIdx]
+      
+      if (!cluster) {
+        console.warn(`Cluster index ${item.clusterIndex} not found`)
+        return null
+      }
+      
+      return {
+        title: item.title,
+        description: item.description,
+        priority: item.priority || 'medium',
+        reasoning: item.reasoning,
+        feedbackIds: cluster.feedbackIds,
+        feedbackItems: cluster.items,
+        feedbackCount: cluster.size,
+        totalArr: cluster.totalArr,
+        uniqueAccounts: cluster.uniqueAccounts,
+      }
+    }).filter(Boolean)
+    
+  } catch (error) {
+    console.error('Failed to name clusters:', error)
+    return []
+  }
+}
+
 // Re-export embedding functions for convenience
 export { embedIdea, embedFeedback } from './embeddings'
